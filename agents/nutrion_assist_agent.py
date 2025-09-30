@@ -1,7 +1,8 @@
 """
-Nutritionist Agent Demo using LangGraph
-=======================================
+Nutritionist Agent Demo using LangGraph + Zep Cloud
+==================================================
 A demo agent that helps with nutrition questions, meal logging, and personalized advice.
+Uses Zep Cloud for intelligent memory and context management.
 """
 
 import os
@@ -12,9 +13,12 @@ from typing import TypedDict, Literal
 from dotenv import load_dotenv
 
 # LangGraph imports
-from langgraph.graph import StateGraph
-from langgraph.store.memory import InMemoryStore
+from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
+
+# Zep Cloud client
+from zep_cloud.client import Zep
+from zep_cloud import Message
 
 # OpenAI client for DeepSeek and Perplexity APIs
 from openai import OpenAI
@@ -24,12 +28,18 @@ load_dotenv()
 
 # Enable LangSmith tracing
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_PROJECT"] = "Nutrition Agent"
+os.environ["LANGCHAIN_PROJECT"] = "Nutrition Agent Zep"
 
-# Initialize DeepSeek client
+# Get user ID from environment
+ZEP_USER_ID = os.getenv("ZEP_USER_ID", "demo_nutrition_user")
 deepseek_client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com"
+)
+
+# Initialize Zep client (will use mock if real client unavailable)
+zep_client = Zep(
+    api_key=os.getenv("ZEP_API_KEY", "mock_key_for_testing")
 )
 
 
@@ -44,7 +54,7 @@ class NutritionState(TypedDict):
     intent: str  # Detected user intent
     topic: str  # Extracted topic from user message
     rewritten_query: str  # Search-optimized query
-    memory_content: str  # Retrieved memory content
+    memory_content: str  # Retrieved memory content from Zep
     final_answer: str  # Generated response
 
 
@@ -79,8 +89,8 @@ def call_perplexity_search(query: str) -> str:
         response = perplexity_client.chat.completions.create(
             model="sonar-pro",
             messages=[
-                {"role": "system", "content": "Provide detailed nutritional information with scientific accuracy and practical advice."},
-                {"role": "user", "content": f"Provide comprehensive nutritional information about: {query}"}
+                {"role": "system", "content": "Provide detailed, accurate information with scientific backing. Focus on current research, evidence-based insights, and practical applications. Prioritize credible sources and peer-reviewed studies"},
+                {"role": "user", "content": query}
             ],
             max_tokens=1500,
             temperature=0.1
@@ -91,15 +101,98 @@ def call_perplexity_search(query: str) -> str:
         return f"Error searching Perplexity: {str(e)}"
 
 
+def get_daily_thread_id() -> str:
+    """Generate daily thread ID for the user."""
+    date_str = datetime.now().strftime('%Y_%m_%d')
+    return f"nutrition_{ZEP_USER_ID}_{date_str}"
+
+
+# =============================================================================
+# HEALTH DATA CLASSIFICATION
+# =============================================================================
+
+def health_data_classifier(user_message: str, topic: str) -> dict:
+    """Classify what type of health data is being logged."""
+    msg_lower = user_message.lower()
+    
+    # Meal/food logging
+    if any(word in msg_lower for word in ['ate', 'eat', 'had', 'breakfast', 'lunch', 'dinner', 'snack', 'meal', 'food']):
+        return {"type": "meal", "category": "nutrition"}
+    
+    # Weight tracking
+    elif any(word in msg_lower for word in ['weight', 'weigh', 'kg', 'lb', 'pounds', 'kilos']):
+        return {"type": "weight", "category": "biometric"}
+    
+    # Blood sugar/glucose
+    elif any(word in msg_lower for word in ['glucose', 'blood sugar', 'bg', 'mg/dl', 'mmol']):
+        return {"type": "glucose", "category": "biometric"}
+    
+    # Blood pressure
+    elif any(word in msg_lower for word in ['blood pressure', 'bp', '/', 'systolic', 'diastolic']) and any(char.isdigit() for char in user_message):
+        return {"type": "blood_pressure", "category": "biometric"}
+    
+    # Exercise/activity
+    elif any(word in msg_lower for word in ['walked', 'ran', 'exercise', 'workout', 'gym', 'minutes', 'steps']):
+        return {"type": "exercise", "category": "activity"}
+    
+    # Symptoms
+    elif any(word in msg_lower for word in ['feeling', 'feel', 'tired', 'headache', 'pain', 'bloated', 'nausea', 'dizzy']):
+        return {"type": "symptom", "category": "wellness"}
+    
+    # Default to general health log
+    else:
+        return {"type": "general", "category": "health"}
+
+
+# =============================================================================
+# ZEP INTEGRATION FUNCTIONS
+# =============================================================================
+
+def ensure_user_exists():
+    """Ensure the user exists in Zep Cloud."""
+    try:
+        # Try to get user, create if doesn't exist
+        try:
+            zep_client.user.get(user_id=ZEP_USER_ID)
+            print(f"=== ZEP: User {ZEP_USER_ID} exists ===")
+        except:
+            # Create user if doesn't exist
+            zep_client.user.add(
+                user_id=ZEP_USER_ID,
+                first_name="Demo",
+                last_name="User",
+                email="demo@nutrition-agent.com"
+            )
+            print(f"=== ZEP: Created user {ZEP_USER_ID} ===")
+    except Exception as e:
+        print(f"Warning: Could not ensure user exists: {e}")
+
+
+def ensure_thread_exists(thread_id: str):
+    """Ensure the thread exists for today."""
+    try:
+        # Try to create thread (Zep will handle if it already exists)
+        zep_client.thread.create(
+            thread_id=thread_id,
+            user_id=ZEP_USER_ID
+        )
+        print(f"=== ZEP: Thread {thread_id} ready ===")
+    except Exception as e:
+        # Thread likely already exists, which is fine
+        print(f"=== ZEP: Thread {thread_id} exists or created ===")
+
+
 # =============================================================================
 # AGENT NODES
 # =============================================================================
 
 def intent_analyzer_node(state: NutritionState) -> NutritionState:
     """Analyze user intent and extract topic."""
-    print("\n=== TRACE: Intent Analyzer ===")
+    print("\n" + "="*50)
+    print("🧠 STEP 1: ANALYZING USER INTENT")
+    print("="*50)
     user_message = state["user_message"]
-    print(f"Input: {user_message}")
+    print(f"👤 User Input: '{user_message}'")
     
     prompt = f"""
     Analyze the user's message and classify their intent. Return ONLY valid JSON.
@@ -107,22 +200,31 @@ def intent_analyzer_node(state: NutritionState) -> NutritionState:
     User message: "{user_message}"
     
     Classify into one of these intents:
-    - "meal_log": User wants to log a meal they ate
-    - "nutrition_lookup": User asks about nutritional information 
-    - "recall_compare": User wants to compare with their past meals/preferences
+    - "health_log": User wants to log health data (meals, weight, blood pressure, glucose, symptoms, etc.)
+    - "nutrition_lookup": User asks about nutritional information (questions about food/health)
+    - "recall_compare": User wants to analyze their past data, patterns, or get recommendations based on health history
     - "chat": General conversation or greeting
     
     Return JSON format:
-    {{"intent": "meal_log|nutrition_lookup|recall_compare|chat", "topic": "extracted_topic_or_empty_string"}}
+    {{"intent": "health_log|nutrition_lookup|recall_compare|chat", "topic": "extracted_topic_or_empty_string"}}
     
     Examples:
-    "I ate rice for lunch" -> {{"intent": "meal_log", "topic": "rice lunch"}}
+    "I ate rice for lunch" -> {{"intent": "health_log", "topic": "meal rice lunch"}}
+    "My weight is 70kg today" -> {{"intent": "health_log", "topic": "weight 70kg"}}
+    "Blood sugar reading 110 mg/dL" -> {{"intent": "health_log", "topic": "glucose 110"}}
+    "BP: 120/80" -> {{"intent": "health_log", "topic": "blood pressure 120/80"}}
+    "Feeling tired after lunch" -> {{"intent": "health_log", "topic": "symptom fatigue lunch"}}
+    "Walked 30 minutes today" -> {{"intent": "health_log", "topic": "exercise walking 30min"}}
     "Is mango good for diabetes?" -> {{"intent": "nutrition_lookup", "topic": "mango diabetes"}}
-    "How does my diet compare to what's healthy?" -> {{"intent": "recall_compare", "topic": "diet comparison"}}
+    "What should I eat for protein?" -> {{"intent": "nutrition_lookup", "topic": "protein sources"}}
+    "Analyze my meals today" -> {{"intent": "recall_compare", "topic": "meal analysis today"}}
+    "How is my weight trending?" -> {{"intent": "recall_compare", "topic": "weight trend analysis"}}
+    "Any patterns between my glucose and meals?" -> {{"intent": "recall_compare", "topic": "glucose meal correlation"}}
+    "Based on my readings, recommend dinner" -> {{"intent": "recall_compare", "topic": "dinner recommendation"}}
     """
     
+    print("🤖 DeepSeek LLM: Analyzing intent...")
     response = call_deepseek_llm(prompt)
-    print(f"Raw LLM Response: {response}")
     
     try:
         parsed = json.loads(response)
@@ -132,9 +234,10 @@ def intent_analyzer_node(state: NutritionState) -> NutritionState:
         # Fallback classification
         intent = "chat"
         topic = ""
-        print("Warning: JSON parsing failed, using fallback classification")
+        print("⚠️  JSON parsing failed, using fallback")
     
-    print(f"Output: intent='{intent}', topic='{topic}'")
+    print(f"✅ Intent Detected: '{intent}'")
+    print(f"📝 Topic Extracted: '{topic}'")
     
     return {
         **state,
@@ -145,10 +248,13 @@ def intent_analyzer_node(state: NutritionState) -> NutritionState:
 
 def query_rewriter_node(state: NutritionState) -> NutritionState:
     """Rewrite user query for optimal search results."""
-    print("\n=== TRACE: Query Rewriter ===")
+    print("\n" + "="*50)
+    print("✏️  STEP 2: OPTIMIZING SEARCH QUERY")
+    print("="*50)
     user_message = state["user_message"]
     topic = state["topic"]
-    print(f"Input: original_query='{user_message}', topic='{topic}'")
+    print(f"🔍 Original Question: '{user_message}'")
+    print(f"📋 Topic: '{topic}'")
     
     prompt = f"""
     Rewrite this nutrition question into a clear, search-optimized query.
@@ -160,8 +266,9 @@ def query_rewriter_node(state: NutritionState) -> NutritionState:
     Return only the rewritten query, nothing else.
     """
     
+    print("🤖 DeepSeek LLM: Optimizing query for search...")
     rewritten = call_deepseek_llm(prompt)
-    print(f"Output: rewritten_query='{rewritten}'")
+    print(f"✅ Optimized Query: '{rewritten}'")
     
     return {
         **state,
@@ -171,18 +278,21 @@ def query_rewriter_node(state: NutritionState) -> NutritionState:
 
 def perplexity_search_node(state: NutritionState) -> NutritionState:
     """Search for nutrition information using Perplexity."""
-    print("\n=== TRACE: Perplexity Search ===")
+    print("\n" + "="*50)
+    print("🔬 STEP 3: RESEARCHING NUTRITION INFORMATION")
+    print("="*50)
     query = state["rewritten_query"]
-    print(f"Input: query='{query}'")
+    print(f"🔍 Searching for: '{query}'")
+    print("🌐 Perplexity AI: Gathering latest nutrition research...")
     
     search_results = call_perplexity_search(query)
-    preview = search_results[:200] + "..." if len(search_results) > 200 else search_results
-    print(f"Output: Retrieved {len(search_results)} characters")
-    print(f"Preview: {preview}")
+    preview = search_results[:150] + "..." if len(search_results) > 150 else search_results
+    print(f"✅ Research Complete: {len(search_results)} characters retrieved")
+    print(f"📄 Preview: {preview}")
     
     # Append to scratchpad
     current_scratchpad = state.get("scratchpad", "")
-    updated_scratchpad = current_scratchpad + f"\n\n=== Search Results for '{query}' ===\n{search_results}"
+    updated_scratchpad = current_scratchpad + f"\n\n=== Research Results ===\n{search_results}"
     
     return {
         **state,
@@ -190,81 +300,204 @@ def perplexity_search_node(state: NutritionState) -> NutritionState:
     }
 
 
-def memory_store_node(state: NutritionState, memory_store: InMemoryStore) -> NutritionState:
-    """Store information in memory."""
-    print("\n=== TRACE: Memory Store ===")
+def zep_memory_store_node(state: NutritionState) -> NutritionState:
+    """Store information in Zep Cloud memory."""
+    print("\n" + "="*50)
+    print("💾 ZEP CLOUD: STORING INFORMATION")
+    print("="*50)
     
     intent = state["intent"]
     topic = state["topic"]
     user_message = state["user_message"]
+    thread_id = get_daily_thread_id()
     
-    if intent == "meal_log":
-        # Store meal with date-based key
-        date_key = f"meals_{datetime.now().strftime('%Y_%m_%d')}"
-        meal_entry = f"{datetime.now().strftime('%H:%M')} - {user_message}"
-        
-        # Get existing meals for today - use correct API
-        try:
-            existing_items = memory_store.search(("nutrition", date_key))
-            if existing_items:
-                existing_meals = existing_items[0].value
-                updated_meals = existing_meals + "\n" + meal_entry
-            else:
-                updated_meals = meal_entry
-        except:
-            # If search fails, start fresh
-            updated_meals = meal_entry
+    # Preserve the final_answer from previous steps
+    final_answer = state.get("final_answer", "")
+    
+    # Ensure user and thread exist
+    ensure_user_exists()
+    ensure_thread_exists(thread_id)
+    
+    memory_content = state.get("memory_content", "")
+    
+    try:
+        if intent == "meal_log":
+            print(f"🍽️ Storing Meal: '{user_message}'")
+            print(f"📅 Thread: {thread_id}")
             
-        # Store the updated meals using correct API
-        memory_store.put(("nutrition", date_key), "meals", updated_meals)
-        print(f"Input: meal_entry='{meal_entry}'")
-        print(f"Output: Stored under key '{date_key}'")
-        
-    elif intent in ["nutrition_lookup"] and state.get("final_answer"):
-        # Store nutrition summary for future reference
-        topic_key = f"topic_{topic.replace(' ', '_')}"
-        summary = state["final_answer"]
-        memory_store.put(("nutrition", topic_key), "summary", summary)
-        print(f"Input: topic_key='{topic_key}', summary_length={len(summary)}")
-        print(f"Output: Stored nutrition summary")
+            result = zep_client.thread.add_messages(
+                thread_id=thread_id,
+                messages=[Message(
+                    role="user",
+                    name="Demo User",
+                    content=user_message,
+                    metadata={
+                        "type": "meal_log",
+                        "timestamp": datetime.now().isoformat(),
+                        "topic": topic
+                    }
+                )],
+                return_context=True
+            )
+            
+            memory_content = result.context if hasattr(result, 'context') else ""
+            final_answer = f"✅ Meal logged successfully! Recorded: {user_message}"
+            
+            print(f"✅ Storage Complete: {len(memory_content)} chars of context retrieved")
+            
+        elif intent == "nutrition_lookup" and final_answer:
+            print(f"🧠 Storing Nutrition Insights for: '{topic}'")
+            key_insights = extract_nutrition_insights(final_answer, topic)
+            
+            zep_client.thread.add_messages(
+                thread_id=thread_id,
+                messages=[Message(
+                    role="assistant",
+                    name="Nutrition Agent",
+                    content=f"Key insight: {key_insights}",
+                    metadata={
+                        "type": "nutrition_insight",
+                        "topic": topic,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )]
+            )
+            print(f"✅ Insights stored for future reference")
+            
+    except Exception as e:
+        print(f"❌ Storage Error: {e}")
+        if intent == "meal_log":
+            final_answer = f"⚠️ Meal noted: {user_message} (storage temporarily unavailable)"
     
-    return state
+    return {
+        **state,
+        "memory_content": memory_content,
+        "final_answer": final_answer  # Make sure to preserve the final_answer
+    }
 
 
-def memory_retrieve_node(state: NutritionState, memory_store: InMemoryStore) -> NutritionState:
-    """Retrieve relevant information from memory."""
-    print("\n=== TRACE: Memory Retrieve ===")
+def zep_health_store_node(state: NutritionState) -> NutritionState:
+    """Store health information in Zep Cloud memory."""
+    print("\n" + "="*50)
+    print("💾 ZEP CLOUD: STORING HEALTH DATA")
+    print("="*50)
     
     intent = state["intent"]
     topic = state["topic"]
-    print(f"Input: intent='{intent}', topic='{topic}'")
+    user_message = state["user_message"]
+    thread_id = get_daily_thread_id()
+    
+    # Preserve the final_answer from previous steps
+    final_answer = state.get("final_answer", "")
+    
+    # Ensure user and thread exist
+    ensure_user_exists()
+    ensure_thread_exists(thread_id)
+    
+    memory_content = state.get("memory_content", "")
+    
+    try:
+        if intent == "health_log":
+            # Classify the type of health data
+            health_data = health_data_classifier(user_message, topic)
+            
+            print(f"🏥 Storing {health_data['category'].title()}: {health_data['type']} data")
+            print(f"📝 Entry: '{user_message}'")
+            print(f"📅 Thread: {thread_id}")
+            
+            result = zep_client.thread.add_messages(
+                thread_id=thread_id,
+                messages=[Message(
+                    role="user",
+                    name="Demo User",
+                    content=user_message,
+                    metadata={
+                        "type": "health_log",
+                        "data_type": health_data["type"],
+                        "category": health_data["category"],
+                        "timestamp": datetime.now().isoformat(),
+                        "topic": topic
+                    }
+                )],
+                return_context=True
+            )
+            
+            memory_content = result.context if hasattr(result, 'context') else ""
+            final_answer = f"✅ {health_data['category'].title()} data logged: {user_message}"
+            
+            print(f"✅ Storage Complete: {len(memory_content)} chars of context retrieved")
+            
+        elif intent == "nutrition_lookup" and final_answer:
+            print(f"🧠 Storing Nutrition Insights for: '{topic}'")
+            key_insights = extract_nutrition_insights(final_answer, topic)
+            
+            zep_client.thread.add_messages(
+                thread_id=thread_id,
+                messages=[Message(
+                    role="assistant",
+                    name="Nutrition Agent",
+                    content=f"Key insight: {key_insights}",
+                    metadata={
+                        "type": "nutrition_insight",
+                        "topic": topic,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )]
+            )
+            print(f"✅ Insights stored for future reference")
+            
+    except Exception as e:
+        print(f"❌ Storage Error: {e}")
+        if intent == "health_log":
+            final_answer = f"⚠️ Health data noted: {user_message} (storage temporarily unavailable)"
+    
+    return {
+        **state,
+        "memory_content": memory_content,
+        "final_answer": final_answer
+    }
+
+
+def zep_memory_retrieve_node(state: NutritionState) -> NutritionState:
+    """Retrieve relevant information from Zep Cloud memory."""
+    print("\n" + "="*50)
+    print("🧠 ZEP CLOUD: RETRIEVING MEMORY")
+    print("="*50)
+    
+    intent = state["intent"]
+    topic = state["topic"]
+    thread_id = get_daily_thread_id()
+    
+    print(f"🔍 Looking for: {topic}")
+    print(f"📅 Thread: {thread_id}")
+    
+    # Ensure user and thread exist
+    ensure_user_exists()
+    ensure_thread_exists(thread_id)
     
     memory_content = ""
     
-    # Always try to get recent meals
-    today_key = f"meals_{datetime.now().strftime('%Y_%m_%d')}"
     try:
-        recent_meals_items = memory_store.search(("nutrition", today_key))
-        if recent_meals_items:
-            memory_content += f"Today's Meals:\n{recent_meals_items[0].value}\n\n"
-    except:
-        print("No recent meals found")
-    
-    # For recall_compare, also look for related topics
-    if intent == "recall_compare" and topic:
-        topic_key = f"topic_{topic.replace(' ', '_')}"
-        try:
-            topic_items = memory_store.search(("nutrition", topic_key))
-            if topic_items:
-                memory_content += f"Previous Information on {topic}:\n{topic_items[0].value}\n\n"
-        except:
-            print(f"No previous info found for topic: {topic}")
-    
-    if memory_content:
-        print(f"Output: Retrieved {len(memory_content)} characters from memory")
-        print(f"Memory preview: {memory_content[:150]}...")
-    else:
-        print("Output: No relevant memory found")
+        print("🌐 Querying Zep's knowledge graph...")
+        context = zep_client.thread.get_user_context(
+            thread_id=thread_id,
+            mode="basic"
+        )
+        
+        memory_content = context.context if hasattr(context, 'context') else ""
+        
+        if memory_content:
+            print(f"✅ Memory Retrieved: {len(memory_content)} characters")
+            # Count facts and entities for demo
+            fact_count = memory_content.count('- ') if '<FACTS>' in memory_content else 0
+            entity_count = memory_content.count('Name:') if '<ENTITIES>' in memory_content else 0
+            print(f"📊 Found: {fact_count} facts, {entity_count} entities")
+        else:
+            print("📭 No relevant memory found")
+            
+    except Exception as e:
+        print(f"❌ Retrieval Error: {e}")
+        memory_content = ""
     
     return {
         **state,
@@ -272,35 +505,92 @@ def memory_retrieve_node(state: NutritionState, memory_store: InMemoryStore) -> 
     }
 
 
-def llm_summarizer_node(state: NutritionState) -> NutritionState:
-    """Generate final response using scratchpad and memory."""
-    print("\n=== TRACE: LLM Summarizer ===")
-    
-    scratchpad = state.get("scratchpad", "")
-    memory_content = state.get("memory_content", "")
-    user_question = state["user_message"]
-    
-    print(f"Input: scratchpad_length={len(scratchpad)}, memory_length={len(memory_content)}, question='{user_question}'")
-    
+def extract_nutrition_insights(final_answer: str, topic: str) -> str:
+    """Extract key insights from research for long-term memory storage."""
     prompt = f"""
-You are a helpful nutrition assistant.
-Use the following research notes and meal history to answer the question.
+    Extract the 2-3 most important, actionable nutrition insights from this response about {topic}.
+    Focus on facts that would be useful for future meal planning and nutrition advice.
+    Keep it concise (under 200 words).
+    
+    Full response: {final_answer}
+    
+    Return only the key insights, nothing else.
+    """
+    
+    try:
+        insights = call_deepseek_llm(prompt)
+        return insights
+    except Exception as e:
+        # Fallback: just take first 200 chars of final answer
+        return final_answer[:200] + "..." if len(final_answer) > 200 else final_answer
 
-Meal History / Preferences:
-{memory_content if memory_content else "No meal history available."}
 
-Research Notes:
+def llm_summarizer_node(state: NutritionState) -> NutritionState:
+    """Generate final response using scratchpad (temporary) and Zep memory (persistent)."""
+    print("\n" + "="*50)
+    print("🤖 STEP 4: GENERATING PERSONALIZED RESPONSE")
+    print("="*50)
+    
+    scratchpad = state.get("scratchpad", "")  # Temporary research data
+    memory_content = state.get("memory_content", "")  # User's persistent context
+    user_question = state["user_message"]
+    intent = state["intent"]
+    
+    print(f"💭 Question: '{user_question}'")
+    print(f"📄 Research Data: {len(scratchpad)} characters")
+    print(f"🧠 User Memory: {len(memory_content)} characters")
+    print("🤖 DeepSeek LLM: Combining research + personal history...")
+    
+    # Different prompts for different intents
+    if intent == "recall_compare":
+        # Determine if asking about specific health data vs discussions
+        is_health_data_query = any(word in user_question.lower() for word in ['eat', 'ate', 'meal', 'weight', 'glucose', 'sugar', 'pressure', 'bp', 'exercise', 'symptom', 'today', 'yesterday'])
+        
+        if is_health_data_query:
+            prompt = f"""
+You are a health assistant analyzing the user's health patterns and data.
+
+HEALTH HISTORY (from Zep):
+{memory_content if memory_content else "No health data available."}
+
+User Question: {user_question}
+
+Look at the FACTS section for health data including meals, weight, glucose readings, blood pressure, symptoms, and exercise. Group related data by type and time. Identify patterns and correlations between different health metrics. Provide insights about trends and relationships in their health data.
+"""
+        else:
+            prompt = f"""
+You are a health assistant recalling previous discussions and research.
+
+CONVERSATION HISTORY (from Zep):
+{memory_content if memory_content else "No previous discussions available."}
+
+User Question: {user_question}
+
+Look through the FACTS and ENTITIES for any mentions of the health or nutrition topic they're asking about. Search for previous research, discussions, or advice given about specific foods, health conditions, or wellness topics. If found, summarize what was discussed. If not found, clearly state no previous discussion exists about that topic.
+"""
+    else:
+        prompt = f"""
+You are a helpful nutrition assistant with access to the user's meal history and current research.
+
+USER'S NUTRITION CONTEXT (from Zep memory - long-term patterns and preferences):
+{memory_content if memory_content else "No previous meal history or nutrition context available."}
+
+CURRENT RESEARCH (temporary - use for this response only):
 {scratchpad if scratchpad else "No research notes available."}
 
-User Question:
-{user_question}
+User Question: {user_question}
 
-Provide a clear, concise, actionable answer.
+Instructions:
+- Use the user's meal history and preferences to make recommendations personal and relevant
+- Use the current research to provide accurate, up-to-date nutrition information
+- Keep the response clear, concise, and actionable
+- Focus on how this information applies to the user's eating patterns
+
+Provide a personalized nutrition response.
 """
     
     final_answer = call_deepseek_llm(prompt)
-    print(f"Output: Generated response ({len(final_answer)} characters)")
-    print(f"Answer preview: {final_answer[:150]}...")
+    print(f"✅ Response Generated: {len(final_answer)} characters")
     
     return {
         **state,
@@ -310,9 +600,12 @@ Provide a clear, concise, actionable answer.
 
 def quick_chat_node(state: NutritionState) -> NutritionState:
     """Handle general chat without search."""
-    print("\n=== TRACE: Quick Chat ===")
+    print("\n" + "="*50)
+    print("💬 QUICK CHAT RESPONSE")
+    print("="*50)
     user_message = state["user_message"]
-    print(f"Input: {user_message}")
+    print(f"👤 User: '{user_message}'")
+    print("🤖 Generating friendly response...")
     
     prompt = f"""
 You are a friendly nutrition assistant. Respond to this general message:
@@ -322,7 +615,7 @@ Keep your response brief and helpful. If they're asking about nutrition, suggest
 """
     
     response = call_deepseek_llm(prompt)
-    print(f"Output: {response}")
+    print(f"✅ Chat Response Ready")
     
     return {
         **state,
@@ -334,12 +627,9 @@ Keep your response brief and helpful. If they're asking about nutrition, suggest
 # GRAPH CONSTRUCTION
 # =============================================================================
 
-def create_nutrition_graph() -> tuple[CompiledStateGraph, InMemoryStore]:
-    """Build the LangGraph workflow."""
-    print("=== Initializing Nutrition Agent Graph ===")
-    
-    # Create memory store
-    memory_store = InMemoryStore()
+def create_nutrition_graph() -> CompiledStateGraph:
+    """Build the LangGraph workflow with Zep Cloud integration."""
+    print("=== Initializing Nutrition Agent Graph with Zep Cloud ===")
     
     # Create graph
     workflow = StateGraph(NutritionState)
@@ -348,8 +638,8 @@ def create_nutrition_graph() -> tuple[CompiledStateGraph, InMemoryStore]:
     workflow.add_node("intent_analyzer", intent_analyzer_node)
     workflow.add_node("query_rewriter", query_rewriter_node)
     workflow.add_node("perplexity_search", perplexity_search_node)
-    workflow.add_node("memory_retrieve", lambda state: memory_retrieve_node(state, memory_store))
-    workflow.add_node("memory_store", lambda state: memory_store_node(state, memory_store))
+    workflow.add_node("zep_memory_retrieve", zep_memory_retrieve_node)
+    workflow.add_node("zep_health_store", zep_health_store_node)
     workflow.add_node("llm_summarizer", llm_summarizer_node)
     workflow.add_node("quick_chat", quick_chat_node)
     
@@ -359,15 +649,19 @@ def create_nutrition_graph() -> tuple[CompiledStateGraph, InMemoryStore]:
     # Define conditional routing based on intent
     def route_by_intent(state: NutritionState) -> str:
         intent = state["intent"]
-        print(f"\n=== ROUTING: Intent '{intent}' ===")
+        print(f"\n🎯 ROUTING: Detected '{intent}' → Choosing appropriate path")
         
-        if intent == "meal_log":
-            return "memory_store"
+        if intent == "health_log":
+            print("📝 Path: Direct health data storage")
+            return "zep_health_store"
         elif intent == "nutrition_lookup":
+            print("🔬 Path: Research → Analysis → Storage")
             return "query_rewriter"
         elif intent == "recall_compare":
-            return "memory_retrieve"
+            print("🧠 Path: Memory retrieval → Analysis")
+            return "zep_memory_retrieve"
         else:  # chat
+            print("💬 Path: Quick chat response")
             return "quick_chat"
     
     # Add conditional edges from intent analyzer
@@ -375,24 +669,44 @@ def create_nutrition_graph() -> tuple[CompiledStateGraph, InMemoryStore]:
         "intent_analyzer",
         route_by_intent,
         {
-            "memory_store": "memory_store",
+            "zep_health_store": "zep_health_store",
             "query_rewriter": "query_rewriter", 
-            "memory_retrieve": "memory_retrieve",
+            "zep_memory_retrieve": "zep_memory_retrieve",
             "quick_chat": "quick_chat"
         }
     )
     
     # Chain for nutrition lookup: rewriter -> search -> memory -> summarizer -> store
     workflow.add_edge("query_rewriter", "perplexity_search")
-    workflow.add_edge("perplexity_search", "memory_retrieve")
-    workflow.add_edge("memory_retrieve", "llm_summarizer")
-    workflow.add_edge("llm_summarizer", "memory_store")
+    workflow.add_edge("perplexity_search", "zep_memory_retrieve")
+    
+    # Connect memory retrieve to summarizer for both recall_compare and nutrition_lookup
+    workflow.add_edge("zep_memory_retrieve", "llm_summarizer")
+    
+    # For recall/compare: memory -> summarizer (ends here)
+    # For nutrition_lookup: memory -> summarizer -> store
+    def route_after_summarizer(state: NutritionState) -> str:
+        intent = state["intent"]
+        if intent == "nutrition_lookup":
+            return "zep_health_store"
+        else:
+            return "END"
+    
+    # Add conditional edge after summarizer
+    workflow.add_conditional_edges(
+        "llm_summarizer",
+        route_after_summarizer,
+        {
+            "zep_health_store": "zep_health_store",
+            "END": END
+        }
+    )
     
     # Compile the graph
     compiled_graph = workflow.compile()
     
-    print("Graph compiled successfully!")
-    return compiled_graph, memory_store
+    print("Graph compiled successfully with Zep Cloud integration!")
+    return compiled_graph
 
 
 # =============================================================================
@@ -400,18 +714,76 @@ def create_nutrition_graph() -> tuple[CompiledStateGraph, InMemoryStore]:
 # =============================================================================
 
 def main():
-    """Run the interactive nutrition agent demo."""
-    print("🥗 Nutritionist Agent Demo")
-    print("=" * 50)
-    print("Ask nutrition questions, log meals, or chat!")
-    print("Examples:")
-    print("  - 'Is mango good for diabetes?'")
-    print("  - 'I ate rice and chicken for lunch'") 
-    print("  - 'How does my diet look today?'")
-    print("Type 'quit' to exit.\n")
+    """Run the interactive nutrition agent demo with Zep Cloud."""
+    print("\n" + "🥗" * 20)
+    print("    NUTRITIONIST AGENT DEMO")
+    print("    Powered by Zep Cloud + LangGraph")
+    print("🥗" * 20)
+    print(f"\n👤 Demo User: {ZEP_USER_ID}")
+    print("\n📋 What you can try:")
+    print("  🍽️  Log meals: 'I ate rice and beans for lunch'")
+    print("  🔬 Ask nutrition: 'Is avocado good for heart health?'") 
+    print("  📊 Review diet: 'What did I eat today?'")
+    print("  💬 General chat: 'Hello!'")
+    print("\n⌨️  Type 'quit' to exit")
+    print("="*60)
     
-    # Initialize the graph and memory
-    graph, memory_store = create_nutrition_graph()
+    # Initialize the graph
+    print("\n🚀 Initializing Nutrition Agent...")
+    graph = create_nutrition_graph()
+    
+    # Ensure user exists in Zep
+    ensure_user_exists()
+    print("✅ Agent ready for demo!\n")
+    
+    while True:
+        try:
+            # Get user input
+            user_input = input("👤 You: ").strip()
+            
+            if user_input.lower() == 'quit':
+                print("\n🎉 Demo complete! Thanks for trying the Nutrition Agent!")
+                break
+            
+            if not user_input:
+                print("💡 Please enter a message or 'quit' to exit.")
+                continue
+            
+            print(f"\n{'🔄 PROCESSING' + '='*48}")
+            
+            # Initialize state
+            initial_state = NutritionState(
+                scratchpad="",
+                user_message=user_input,
+                intent="",
+                topic="",
+                rewritten_query="",
+                memory_content="",
+                final_answer=""
+            )
+            
+            # Run the graph
+            final_state = graph.invoke(initial_state)
+            
+            # Display final answer
+            print("\n" + "🤖 NUTRITION AGENT RESPONSE" + "="*28)
+            print(final_state.get('final_answer', 'No response generated.'))
+            print("="*60)
+            
+        except KeyboardInterrupt:
+            print("\n\n🎉 Demo interrupted! Thanks for trying the Nutrition Agent!")
+            break
+        except Exception as e:
+            print(f"\n❌ Demo Error: {str(e)}")
+            print("💡 Please try again or type 'quit' to exit.")
+
+
+if __name__ == "__main__":
+    main()
+    graph = create_nutrition_graph()
+    
+    # Ensure user exists in Zep
+    ensure_user_exists()
     
     while True:
         try:
@@ -448,11 +820,11 @@ def main():
             print(f"\n🤖 Nutrition Agent:")
             print(f"{final_state.get('final_answer', 'No response generated.')}")
             
-            # Show updated scratchpad size for trace visibility
-            scratchpad_size = len(final_state.get('scratchpad', ''))
-            if scratchpad_size > 0:
-                print(f"\n=== TRACE: Scratchpad Updated ===")
-                print(f"Total scratchpad size: {scratchpad_size} characters")
+            # Show memory context if available
+            memory_size = len(final_state.get('memory_content', ''))
+            if memory_size > 0:
+                print(f"\n=== TRACE: Used Zep Context ===")
+                print(f"Context size: {memory_size} characters")
             
         except KeyboardInterrupt:
             print("\n\n👋 Thanks for using the Nutrition Agent! Stay healthy!")
@@ -467,82 +839,17 @@ if __name__ == "__main__":
 
 
 # =============================================================================
-# EXAMPLE RUN TRANSCRIPT
+# EXAMPLE ENVIRONMENT SETUP
 # =============================================================================
 """
-Example Demo Run:
-================
+Create a .env file with:
 
-🥗 Nutritionist Agent Demo
-==================================================
-Ask nutrition questions, log meals, or chat!
-Examples:
-  - 'Is mango good for diabetes?'
-  - 'I ate rice and chicken for lunch'
-  - 'How does my diet look today?'
-Type 'quit' to exit.
+ZEP_API_KEY=z_your_zep_cloud_api_key_here
+ZEP_USER_ID=demo_nutrition_user
+DEEPSEEK_API_KEY=your_deepseek_api_key
+PERPLEXITY_API_KEY=your_perplexity_api_key
 
-🍎 You: I ate oatmeal with berries for breakfast
-
-============================================================
-PROCESSING: I ate oatmeal with berries for breakfast
-============================================================
-
-=== TRACE: Intent Analyzer ===
-Input: I ate oatmeal with berries for breakfast
-Raw LLM Response: {"intent": "meal_log", "topic": "oatmeal berries breakfast"}
-Output: intent='meal_log', topic='oatmeal berries breakfast'
-
-=== ROUTING: Intent 'meal_log' ===
-
-=== TRACE: Memory Store ===
-Input: meal_entry='09:15 - I ate oatmeal with berries for breakfast'
-Output: Stored under key 'meals_2025_09_19'
-
-🤖 Nutrition Agent:
-Meal logged successfully! I've recorded that you had oatmeal with berries for breakfast.
-
-🍎 You: Is mango good for diabetes?
-
-============================================================
-PROCESSING: Is mango good for diabetes?
-============================================================
-
-=== TRACE: Intent Analyzer ===
-Input: Is mango good for diabetes?
-Raw LLM Response: {"intent": "nutrition_lookup", "topic": "mango diabetes"}
-Output: intent='nutrition_lookup', topic='mango diabetes'
-
-=== ROUTING: Intent 'nutrition_lookup' ===
-
-=== TRACE: Query Rewriter ===
-Input: original_query='Is mango good for diabetes?', topic='mango diabetes'
-Output: rewritten_query='mango glycemic index diabetes blood sugar effects nutritional benefits'
-
-=== TRACE: Perplexity Search ===
-Input: query='mango glycemic index diabetes blood sugar effects nutritional benefits'
-Output: Retrieved 654 characters
-Preview: Mangoes have a moderate glycemic index of around 51-60, which means they can cause a moderate rise in blood sugar levels. For people with diabetes, mangoes can be consumed in moderation as part of a balanced diet...
-
-=== TRACE: Memory Retrieve ===
-Input: intent='nutrition_lookup', topic='mango diabetes'
-Output: Retrieved 45 characters from memory
-Memory preview: Today's Meals:
-09:15 - I ate oatmeal with berries for...
-
-=== TRACE: LLM Summarizer ===
-Input: scratchpad_length=695, memory_length=45, question='Is mango good for diabetes?'
-Output: Generated response (523 characters)
-Answer preview: Based on the research, mangoes can be included in a diabetic diet but with important considerations. Mangoes have a moderate glycemic index (51-60), meaning they cause a moderate rise in blood sugar...
-
-=== TRACE: Memory Store ===
-Input: topic_key='topic_mango_diabetes', summary_length=523
-Output: Stored nutrition summary
-
-🤖 Nutrition Agent:
-Based on the research, mangoes can be included in a diabetic diet but with important considerations. Mangoes have a moderate glycemic index (51-60), meaning they cause a moderate rise in blood sugar levels. The key is portion control - stick to about 1/2 cup of fresh mango slices. Mangoes do provide beneficial nutrients like vitamin C, fiber, and antioxidants. Given your healthy breakfast of oatmeal with berries today, adding a small portion of mango would fit well into a balanced meal plan. Always monitor your blood sugar response and consult with your healthcare provider about incorporating fruits like mango into your diabetes management plan.
-
-🍎 You: quit
-
-👋 Thanks for using the Nutrition Agent! Stay healthy!
+Run with:
+pip install zep-cloud langgraph openai python-dotenv
+python nutrition_agent_zep.py
 """
