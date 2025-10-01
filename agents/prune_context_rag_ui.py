@@ -111,7 +111,7 @@ def main():
                 "Full original context:",
                 value=results['contexts']['original'],
                 height=200,
-                disabled=True,
+                disabled=False,
                 key="original_context_display"
             )
             st.info(f"**Length:** {len(results['contexts']['original'])} characters")
@@ -122,7 +122,7 @@ def main():
                 "LLM pruned context:",
                 value=results['contexts']['pruned'],
                 height=200,
-                disabled=True,
+                disabled=False,
                 key="pruned_context_display"
             )
             st.info(f"**Length:** {len(results['contexts']['pruned'])} characters")
@@ -152,7 +152,7 @@ def main():
                     "LLM Judge Analysis:",
                     value=results['evaluation']['evaluation'],
                     height=400,
-                    disabled=True
+                    disabled=False
                 )
             
             # Display scores if available
